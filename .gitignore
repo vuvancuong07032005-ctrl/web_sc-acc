@@ -1,0 +1,6 @@
+.env
+serviceAccount.json
+__pycache__/
+*.pyc
+.playwright/
+/tmp/
