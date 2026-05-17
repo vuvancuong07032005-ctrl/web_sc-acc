@@ -267,53 +267,96 @@ async def process_order(order_id: str, order: dict):
 
             # ── 2. Chọn nhà mạng ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn nhà mạng: {carrier_label}")
-            # Chờ carrier buttons xuất hiện (trang dùng JS render)
+            # Chờ img carrier xuất hiện
             try:
-                await page.wait_for_selector("button:has(img[alt*='Mua thẻ'])", timeout=10_000)
+                await page.wait_for_selector("img[alt*='Mua thẻ']", timeout=12_000)
+                log.info("  Carrier images đã load.")
             except Exception:
-                log.warning("  Không chờ được carrier buttons, thử tiếp...")
-            clicked_carrier = False
-            for loc_str in [
-                f"button:has(img[alt*='{carrier_label}'])",   # button chứa img alt="Mua thẻ X"
-                f"img[alt='Mua thẻ {carrier_label}']",        # alt chính xác
-                f"img[alt*='{carrier_label}']",               # alt chứa tên
-                f"[title*='{carrier_label}']",
-                f"text={carrier_label}",
-            ]:
-                try:
-                    loc = page.locator(loc_str).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=5000)
-                        clicked_carrier = True
-                        log.info(f"  → Carrier OK: {loc_str}")
-                        break
-                except Exception:
-                    pass
+                log.warning("  Timeout chờ carrier images, thử tiếp...")
+            await page.wait_for_timeout(500)
+
+            # Dùng JS để click trực tiếp — tránh lỗi selector :has()
+            clicked_carrier = await page.evaluate(f"""() => {{
+                const imgs = [...document.querySelectorAll('img')];
+                const target = imgs.find(img =>
+                    img.alt && img.alt.toLowerCase().includes('{carrier_label.lower()}')
+                );
+                if (target) {{
+                    const btn = target.closest('button') || target.parentElement;
+                    if (btn) {{ btn.click(); return true; }}
+                    target.click();
+                    return true;
+                }}
+                return false;
+            }}""")
+
+            if not clicked_carrier:
+                # Fallback: thử Playwright locator
+                for loc_str in [
+                    f"img[alt*='{carrier_label}']",
+                    f"img[alt='Mua thẻ {carrier_label}']",
+                    f"text={carrier_label}",
+                ]:
+                    try:
+                        loc = page.locator(loc_str).first
+                        if await loc.count() > 0:
+                            await loc.click(timeout=5000)
+                            clicked_carrier = True
+                            log.info(f"  → Carrier OK (fallback): {loc_str}")
+                            break
+                    except Exception:
+                        pass
 
             if not clicked_carrier:
                 raise Exception(f"Không tìm thấy nhà mạng '{carrier_label}'")
+            log.info(f"  → Carrier clicked: {carrier_label}")
             await page.wait_for_timeout(1200)
 
             # ── 3. Chọn mệnh giá ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn mệnh giá: {denom_str}")
             # muathengay.vn hiển thị "500.000" (không có đ) trong ô mệnh giá
-            clicked_denom = False
-            # muathengay.vn: denomination là button[type='submit'] chứa text "100.000Giá bán:..."
-            for loc_str in [
-                f"button[type='submit']:has-text('{denom_vn}')",  # chính xác nhất
-                f"button:has(h6:has-text('{denom_vn}'))",         # h6 chứa face value
-                f"button[type='submit'] h6:has-text('{denom_vn}')",
-                f"text={denom_vn}",
-            ]:
-                try:
-                    loc = page.locator(loc_str).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=5000)
-                        clicked_denom = True
-                        log.info(f"  → Denomination OK: {loc_str} ({denom_vn})")
-                        break
-                except Exception:
-                    pass
+            # Chờ denomination buttons load
+            try:
+                await page.wait_for_selector("button[type='submit'] h6", timeout=8_000)
+            except Exception:
+                log.warning("  Timeout chờ denomination buttons...")
+            await page.wait_for_timeout(300)
+
+            # Dùng JS click denomination
+            clicked_denom = await page.evaluate(f"""() => {{
+                const h6s = [...document.querySelectorAll('button h6, button .text-lg')];
+                const target = h6s.find(h => h.textContent.trim() === '{denom_vn}');
+                if (target) {{
+                    const btn = target.closest('button');
+                    if (btn) {{ btn.click(); return true; }}
+                }}
+                // Fallback: tìm button[type=submit] chứa text mệnh giá
+                const btns = [...document.querySelectorAll('button[type="submit"]')];
+                const b = btns.find(b => b.textContent.includes('{denom_vn}'));
+                if (b) {{ b.click(); return true; }}
+                return false;
+            }}""")
+
+            if not clicked_denom:
+                log.warning(f"  JS click denom failed, thử Playwright...")
+                for loc_str in [
+                    f"button[type='submit']:has-text('{denom_vn}')",
+                    f"h6:has-text('{denom_vn}')",
+                    f"text={denom_vn}",
+                ]:
+                    try:
+                        loc = page.locator(loc_str).first
+                        if await loc.count() > 0:
+                            await loc.click(timeout=5000)
+                            clicked_denom = True
+                            log.info(f"  → Denom OK (fallback): {denom_vn}")
+                            break
+                    except Exception:
+                        pass
+
+            if not clicked_denom:
+                raise Exception(f"Không tìm thấy mệnh giá {denom_str}")
+            log.info(f"  → Denomination clicked: {denom_vn}")
 
             if not clicked_denom:
                 raise Exception(f"Không tìm thấy mệnh giá {denom_str}")
