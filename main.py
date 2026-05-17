@@ -91,45 +91,67 @@ def db_get_pending() -> dict:
 # ── Trích xuất thông tin thanh toán ──────────────────────────────────────────
 async def extract_payment_info(page, denomination: int) -> dict:
     """
-    Trang /thanh-toan-don-hang của muathengay.vn hiển thị:
-      Chủ tài khoản / Ngân hàng / Số tài khoản / Số tiền / Nội dung chuyển khoản
-    Dùng inner_text() của body rồi parse bằng regex theo nhãn chữ.
+    Dùng JavaScript DOM traversal để tìm chính xác từng label → value.
+    Tránh lỗi đọc nhầm do layout 2 cột của trang /thanh-toan-don-hang.
     """
     info = {"amount": denomination}
     await page.wait_for_timeout(2000)
 
     try:
-        body_text = await page.inner_text("body")
-        log.info(f"  [payment page text]:\n{body_text[:500]}")
+        data = await page.evaluate("""() => {
+            function findVal(label) {
+                // Duyệt tất cả element lá (không có con), tìm đúng label text
+                const els = [...document.querySelectorAll('*')].filter(
+                    el => el.children.length === 0 && el.textContent.trim() === label
+                );
+                for (const el of els) {
+                    // Thử nextElementSibling
+                    let sib = el.nextElementSibling;
+                    if (sib) {
+                        const t = sib.textContent.trim();
+                        if (t && t !== label) return t;
+                    }
+                    // Thử parent > nextElementSibling
+                    const parent = el.parentElement;
+                    if (parent) {
+                        let psib = parent.nextElementSibling;
+                        if (psib) {
+                            const t = psib.textContent.trim();
+                            if (t && t !== label) return t;
+                        }
+                    }
+                }
+                return null;
+            }
+            return {
+                accountHolder:   findVal('Chủ tài khoản'),
+                bankName:        findVal('Ngân hàng'),
+                accountNumber:   findVal('Số tài khoản'),
+                transferContent: findVal('Nội dung chuyển khoản'),
+            };
+        }""")
 
-        label_patterns = {
-            "accountHolder":   r"Chủ tài khoản\s*\n\s*(.+)",
-            "bankName":        r"Ngân hàng\s*\n\s*(.+)",
-            "accountNumber":   r"Số tài khoản\s*\n\s*([\d\s]+)",
-            "transferContent": r"Nội dung chuyển khoản\s*\n\s*(.+)",
-        }
-        for field, pattern in label_patterns.items():
-            m = re.search(pattern, body_text, re.IGNORECASE)
-            if m:
-                val = m.group(1).strip().split("\n")[0].strip()
-                if val:
-                    info[field] = val
-                    log.info(f"  {field}: {val!r}")
+        for k, v in (data or {}).items():
+            if v and v.strip() and v.strip() not in ('-', '—'):
+                info[k] = v.strip()
+                log.info(f"  {k}: {v.strip()!r}")
+
     except Exception as e:
-        log.error(f"  extract_payment_info error: {e}")
+        log.error(f"  extract JS error: {e}")
 
-    # Fallback regex: tìm số TK 6-16 chữ số trong HTML
+    # Fallback: regex tìm số TK trong HTML
     if not info.get("accountNumber"):
         try:
             html = await page.content()
             for m in re.findall(r"\b(\d{6,16})\b", html):
-                if not re.match(r"^(202|201|200|199|000|202[456])", m):
+                if not re.match(r"^(202[0-6]|000|999)", m):
                     info["accountNumber"] = m
-                    log.info(f"  accountNumber (regex fallback): {m}")
+                    log.info(f"  accountNumber (fallback): {m}")
                     break
         except Exception:
             pass
 
+    log.info(f"  Payment info final: {info}")
     return info
 
 # ── Poll mã thẻ ───────────────────────────────────────────────────────────────
