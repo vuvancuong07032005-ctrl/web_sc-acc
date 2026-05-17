@@ -267,7 +267,11 @@ async def process_order(order_id: str, order: dict):
 
             # ── 2. Chọn nhà mạng ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn nhà mạng: {carrier_label}")
-            # muathengay.vn hiển thị carrier dưới dạng ô ảnh logo
+            # Chờ carrier buttons xuất hiện (trang dùng JS render)
+            try:
+                await page.wait_for_selector("button:has(img[alt*='Mua thẻ'])", timeout=10_000)
+            except Exception:
+                log.warning("  Không chờ được carrier buttons, thử tiếp...")
             clicked_carrier = False
             for loc_str in [
                 f"button:has(img[alt*='{carrier_label}'])",   # button chứa img alt="Mua thẻ X"
