@@ -237,7 +237,22 @@ async def process_order(order_id: str, order: dict):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-translate",
+                "--hide-scrollbars",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
+            ],
         )
         ctx  = await browser.new_context(
             user_agent=(
@@ -418,12 +433,18 @@ async def process_order(order_id: str, order: dict):
         finally:
             await browser.close()
 
+# ── Semaphore: chỉ 1 trình duyệt chạy 1 lúc (tránh hết RAM) ─────────────────
+_browser_sem = asyncio.Semaphore(1)
+
 # ── Task wrapper ──────────────────────────────────────────────────────────────
 async def handle_order(order_id: str, order: dict, processing: set):
-    try:
-        await process_order(order_id, order)
-    finally:
-        processing.discard(order_id)
+    async with _browser_sem:
+        try:
+            await process_order(order_id, order)
+        except Exception as e:
+            log.error(f"[{order_id}] Unhandled: {e}")
+        finally:
+            processing.discard(order_id)
 
 # ── Vòng lặp chính ───────────────────────────────────────────────────────────
 async def watch():
