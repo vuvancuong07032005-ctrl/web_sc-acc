@@ -276,11 +276,11 @@ async def process_order(order_id: str, order: dict):
             # muathengay.vn hiển thị carrier dưới dạng ô ảnh logo
             clicked_carrier = False
             for loc_str in [
-                f"img[alt='{carrier_label}']",
-                f"img[alt*='{carrier_label}']",
-                f"[title='{carrier_label}']",
+                f"button:has(img[alt*='{carrier_label}'])",   # button chứa img alt="Mua thẻ X"
+                f"img[alt='Mua thẻ {carrier_label}']",        # alt chính xác
+                f"img[alt*='{carrier_label}']",               # alt chứa tên
+                f"[title*='{carrier_label}']",
                 f"text={carrier_label}",
-                f"*:has-text('{carrier_label}')",
             ]:
                 try:
                     loc = page.locator(loc_str).first
@@ -300,25 +300,23 @@ async def process_order(order_id: str, order: dict):
             log.info(f"[{order_id}] Chọn mệnh giá: {denom_str}")
             # muathengay.vn hiển thị "500.000" (không có đ) trong ô mệnh giá
             clicked_denom = False
-            for dv in [denom_vn, denom_str, str(denomination), f"{denomination // 1000}K"]:
-                for loc_str in [
-                    f"text={dv}",
-                    f"*:has-text('{dv}')",
-                    f"[data-value='{denomination}']",
-                    f"button:has-text('{dv}')",
-                ]:
-                    try:
-                        # Lọc đúng ô mệnh giá (tránh click vào "Giá bán")
-                        loc = page.locator(loc_str).first
-                        if await loc.count() > 0:
-                            await loc.click(timeout=5000)
-                            clicked_denom = True
-                            log.info(f"  → Denomination OK: {loc_str} ({dv})")
-                            break
-                    except Exception:
-                        pass
-                if clicked_denom:
-                    break
+            # muathengay.vn dùng <button><h6 class="text-lg font-bold">100.000</h6>...
+            for loc_str in [
+                f"button:has(h6:has-text('{denom_vn}'))",   # chính xác nhất
+                f"h6:has-text('{denom_vn}')",                # h6 chứa "100.000"
+                f"button:has-text('{denom_vn}')",            # button chứa text
+                f"text={denom_vn}",
+                f"[data-value='{denomination}']",
+            ]:
+                try:
+                    loc = page.locator(loc_str).first
+                    if await loc.count() > 0:
+                        await loc.click(timeout=5000)
+                        clicked_denom = True
+                        log.info(f"  → Denomination OK: {loc_str} ({denom_vn})")
+                        break
+                except Exception:
+                    pass
 
             if not clicked_denom:
                 raise Exception(f"Không tìm thấy mệnh giá {denom_str}")
@@ -327,10 +325,10 @@ async def process_order(order_id: str, order: dict):
             # ── 4. Nhập email ─────────────────────────────────────────
             log.info(f"[{order_id}] Nhập email: {ORDER_EMAIL}")
             for email_sel in [
-                "input[type='email']",
+                "input[placeholder='Nhập email']",    # chính xác theo HTML thật
+                "input[placeholder*='email' i]",       # chứa "email" (case-insensitive)
+                "input[type='text'][placeholder*='mail']",
                 "input[name='email']",
-                "input[placeholder*='email' i]",
-                "input[placeholder*='Email']",
                 "#email",
             ]:
                 try:
@@ -347,11 +345,11 @@ async def process_order(order_id: str, order: dict):
             # ── 5. Click "Thanh toán" ─────────────────────────────────
             log.info(f"[{order_id}] Click Thanh toán...")
             for buy_sel in [
+                "button[type='button']:has-text('Thanh toán')",  # chính xác theo HTML thật
                 "button:has-text('Thanh toán')",
-                "a:has-text('Thanh toán')",
+                "button.bg-primary:has-text('Thanh toán')",
                 "button:has-text('THANH TOÁN')",
                 "button:has-text('Mua ngay')",
-                "button:has-text('Đặt hàng')",
                 "input[type='submit']",
                 "button[type='submit']",
             ]:
