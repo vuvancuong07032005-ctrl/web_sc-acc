@@ -99,25 +99,16 @@ async def extract_payment_info(page, denomination: int) -> dict:
 
     try:
         data = await page.evaluate("""() => {
+            // DOM thật: label là <p> bên trong DIV.p-4
+            // value = p.nextElementSibling.textContent
             function findVal(label) {
-                // Duyệt tất cả element lá (không có con), tìm đúng label text
-                const els = [...document.querySelectorAll('*')].filter(
-                    el => el.children.length === 0 && el.textContent.trim() === label
-                );
-                for (const el of els) {
-                    // Thử nextElementSibling
-                    let sib = el.nextElementSibling;
-                    if (sib) {
-                        const t = sib.textContent.trim();
-                        if (t && t !== label) return t;
-                    }
-                    // Thử parent > nextElementSibling
-                    const parent = el.parentElement;
-                    if (parent) {
-                        let psib = parent.nextElementSibling;
-                        if (psib) {
-                            const t = psib.textContent.trim();
-                            if (t && t !== label) return t;
+                const pTags = [...document.querySelectorAll('p')];
+                for (const p of pTags) {
+                    if (p.textContent.trim() === label) {
+                        const sib = p.nextElementSibling;
+                        if (sib) {
+                            const t = sib.textContent.trim();
+                            if (t) return t;
                         }
                     }
                 }
