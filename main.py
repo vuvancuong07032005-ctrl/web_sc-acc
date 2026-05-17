@@ -409,49 +409,40 @@ async def process_order(order_id: str, order: dict):
                     pass
             await page.wait_for_timeout(500)
 
-            # ── 5. Click "Thanh toán" lần 1 ──────────────────────────
-            log.info(f"[{order_id}] Click Thanh toán lần 1...")
-            for buy_sel in [
-                "button[type='button']:has-text('Thanh toán')",
-                "button:has-text('Thanh toán')",
-                "button.bg-primary:has-text('Thanh toán')",
-                "button:has-text('THANH TOÁN')",
-            ]:
-                try:
-                    loc = page.locator(buy_sel).first
-                    if await loc.count() > 0:
-                        await loc.click(timeout=8000)
-                        log.info(f"  → Click 1 OK: {buy_sel}")
-                        break
-                except Exception:
-                    pass
+            # ── 5. Submit bằng JS click (bypass visibility/overlay) ──────
+            log.info(f"[{order_id}] JS click Thanh toán lần 1...")
+            await page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button[type="button"]')];
+                const btn = btns.find(b => b.textContent.trim() === 'Thanh toán');
+                if (btn) { btn.click(); return true; }
+                // fallback: bất kỳ button nào có text Thanh toán
+                const any = [...document.querySelectorAll('button')]
+                    .find(b => b.textContent.trim() === 'Thanh toán');
+                if (any) any.click();
+            }""")
+            log.info(f"[{order_id}] Chờ modal xác nhận...")
+            await page.wait_for_timeout(2500)
 
-            # Chờ modal xác nhận (muathengay.vn hiện modal trước khi redirect)
-            await page.wait_for_timeout(2000)
-
-            # Click "Thanh toán" lần 2 trong modal (nếu URL chưa đổi)
+            # Click lần 2 trong modal (nếu chưa redirect)
             if "thanh-toan-don-hang" not in page.url:
-                log.info(f"[{order_id}] Modal xác nhận → click Thanh toán lần 2...")
-                try:
-                    # Lấy nút Thanh toán cuối cùng (trong modal)
-                    btns = page.locator("button:has-text('Thanh toán')")
-                    cnt = await btns.count()
-                    log.info(f"  Tìm thấy {cnt} nút Thanh toán")
-                    if cnt > 0:
-                        await btns.last.click(timeout=8000)
-                        log.info("  → Click modal OK")
-                except Exception as e:
-                    log.warning(f"  Modal click lỗi: {e}")
+                log.info(f"[{order_id}] JS click Thanh toán lần 2 (modal)...")
+                await page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button')]
+                        .filter(b => b.textContent.trim() === 'Thanh toán');
+                    if (btns.length > 0) btns[btns.length - 1].click();
+                }""")
+                await page.wait_for_timeout(2000)
 
-            # Chờ chuyển sang trang /thanh-toan-don-hang
+            # Chờ redirect sang trang thanh toán (tối đa 40s)
             try:
-                await page.wait_for_url("**/thanh-toan-don-hang**", timeout=20_000)
-                log.info(f"[{order_id}] URL đã đổi → {page.url[:80]}")
+                await page.wait_for_url("**/thanh-toan**", timeout=40_000)
+                log.info(f"[{order_id}] ✅ Redirect OK → {page.url[:80]}")
             except Exception:
-                log.warning(f"[{order_id}] Không chờ được URL, tiếp tục...")
+                log.warning(f"[{order_id}] Không redirect được. URL hiện: {page.url[:80]}")
 
             await page.wait_for_load_state("networkidle", timeout=20_000)
             await page.wait_for_timeout(2000)
+            log.info(f"[{order_id}] URL khi extract: {page.url[:100]}")
 
             # ── 6. Lấy thông tin thanh toán ──────────────────────────
             log.info(f"[{order_id}] Trích xuất thông tin thanh toán...")
