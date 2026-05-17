@@ -14,6 +14,7 @@ import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
+from curl_cffi.requests import AsyncSession as CurlSession
 import httpx
 from dotenv import load_dotenv
 
@@ -131,15 +132,26 @@ async def extract_payment_info(page, denomination: int) -> dict:
     except Exception as e:
         log.error(f"  extract JS error: {e}")
 
-    # Fallback: regex tìm số TK trong HTML
+    # Fallback: regex tìm số TK trong HTML (lọc kỹ để không lấy Google Ads ID)
     if not info.get("accountNumber"):
         try:
             html = await page.content()
-            for m in re.findall(r"\b(\d{6,16})\b", html):
-                if not re.match(r"^(202[0-6]|000|999)", m):
-                    info["accountNumber"] = m
-                    log.info(f"  accountNumber (fallback): {m}")
-                    break
+            # Tìm số TK: phải nằm sau label "Số tài khoản" hoặc "STK"
+            stk_match = re.search(
+                r"(?:Số tài khoản|STK)[^\d]{0,30}(\d{6,16})",
+                html, re.IGNORECASE
+            )
+            if stk_match:
+                info["accountNumber"] = stk_match.group(1)
+                log.info(f"  accountNumber (fallback label): {stk_match.group(1)}")
+            else:
+                # Last resort: tìm số 9-16 chữ số, bỏ các ID đã biết
+                EXCLUDE_NUMS = {"18026394539", "1280900", "1440900"}
+                for m in re.findall(r"\b(\d{9,16})\b", html):
+                    if m not in EXCLUDE_NUMS and not re.match(r"^(202[0-9]|AW|1802)", m):
+                        info["accountNumber"] = m
+                        log.info(f"  accountNumber (fallback regex): {m}")
+                        break
         except Exception:
             pass
 
@@ -217,6 +229,48 @@ async def poll_card_code(page, order_id: str) -> str | None:
 
     return None
 
+# ── Lấy Cloudflare clearance cookie bằng curl_cffi ──────────────────────────
+async def get_cf_cookies(order_id: str) -> list[dict]:
+    """
+    Dùng curl_cffi (giả lập TLS fingerprint Chrome thật) để vượt Cloudflare.
+    Trả về list cookie dạng Playwright-compatible để inject vào browser context.
+    """
+    cf_cookies = []
+    try:
+        log.info(f"[{order_id}] curl_cffi: lấy Cloudflare cookies...")
+        async with CurlSession(impersonate="chrome124") as s:
+            r = await s.get(
+                "https://www.muathengay.vn/",
+                timeout=30,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                }
+            )
+            log.info(f"[{order_id}] curl_cffi status: {r.status_code}")
+            for name, value in s.cookies.items():
+                cf_cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": "www.muathengay.vn",
+                    "path": "/",
+                    "httpOnly": name.startswith("__"),
+                    "secure": True,
+                    "sameSite": "Lax",
+                })
+            names = [c["name"] for c in cf_cookies]
+            log.info(f"[{order_id}] curl_cffi cookies nhận được: {names}")
+            has_cf = any("cf_clearance" in n for n in names)
+            if not has_cf:
+                log.warning(f"[{order_id}] ⚠ Không có cf_clearance! Body đầu: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"[{order_id}] curl_cffi lỗi (bỏ qua): {e}")
+    return cf_cookies
+
+
 # ── Xử lý đơn hàng chính ─────────────────────────────────────────────────────
 async def process_order(order_id: str, order: dict):
     carrier_key   = (order.get("carrier") or "").lower()
@@ -228,6 +282,9 @@ async def process_order(order_id: str, order: dict):
 
     log.info(f"[{order_id}] Xử lý: {carrier_label} {denom_str} | @{username}")
     db_update(order_id, {"status": "Đang xử lý", "botStartedAt": datetime.now().isoformat()})
+
+    # ── Bước 0: lấy cf_clearance bằng curl_cffi ──────────────────────────────
+    cf_cookies = await get_cf_cookies(order_id)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -257,23 +314,29 @@ async def process_order(order_id: str, order: dict):
             ),
             viewport={"width": 1280, "height": 900},
         )
+
+        # Inject Cloudflare cookies từ curl_cffi vào Playwright TRƯỚC khi navigate
+        if cf_cookies:
+            await ctx.add_cookies(cf_cookies)
+            log.info(f"[{order_id}] ✅ Đã inject {len(cf_cookies)} cookie vào Playwright context")
+
         page = await ctx.new_page()
-        await stealth_async(page)   # ← ẩn dấu hiệu headless, qua Cloudflare
+        await stealth_async(page)   # ← ẩn dấu hiệu headless
 
         try:
             # ── 1. Mở trang ──────────────────────────────────────────
             log.info(f"[{order_id}] Mở muathengay.vn...")
             await page.goto("https://www.muathengay.vn/", timeout=60_000)
 
-            # Chờ Cloudflare "Just a moment..." tự qua (tối đa 20s)
+            # Chờ Cloudflare "Just a moment..." tự qua (tối đa 25s)
             try:
                 await page.wait_for_function(
                     "document.title !== 'Just a moment...'",
-                    timeout=20_000
+                    timeout=25_000
                 )
-                log.info(f"[{order_id}] Đã qua Cloudflare.")
+                log.info(f"[{order_id}] ✅ Đã qua Cloudflare.")
             except Exception:
-                log.warning(f"[{order_id}] Cloudflare timeout, tiếp tục...")
+                log.warning(f"[{order_id}] ⚠ Cloudflare timeout, tiếp tục...")
 
             await page.wait_for_load_state("networkidle", timeout=20_000)
             await page.wait_for_timeout(2000)
