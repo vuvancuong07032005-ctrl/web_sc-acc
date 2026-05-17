@@ -267,6 +267,20 @@ async def process_order(order_id: str, order: dict):
 
             # ── 2. Chọn nhà mạng ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn nhà mạng: {carrier_label}")
+            # ── DEBUG: xem trang bot đang thấy ─────────────────────────
+            debug = await page.evaluate("""() => ({
+                url:     window.location.href,
+                title:   document.title,
+                imgs:    [...document.querySelectorAll('img')].map(i=>i.alt).filter(a=>a).slice(0,20),
+                btns:    [...document.querySelectorAll('button')].map(b=>b.textContent.trim().slice(0,40)).slice(0,15),
+                body200: document.body?.innerText?.slice(0,200) || ''
+            })""")
+            log.info(f"  [DEBUG] URL: {debug.get('url')}")
+            log.info(f"  [DEBUG] Title: {debug.get('title')}")
+            log.info(f"  [DEBUG] Imgs: {debug.get('imgs')}")
+            log.info(f"  [DEBUG] Btns: {debug.get('btns')}")
+            log.info(f"  [DEBUG] Body: {debug.get('body200')}")
+
             # Chờ img carrier xuất hiện
             try:
                 await page.wait_for_selector("img[alt*='Mua thẻ']", timeout=12_000)
