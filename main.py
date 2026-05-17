@@ -1,14 +1,6 @@
 """
 AccShop Bot — muathengay.vn Automation
-Chạy liên tục trên Railway, lắng nghe Firebase để xử lý đơn thẻ cào tự động.
-
-Flow:
-1. Phát hiện đơn mới status='pending_bot' & type='card' trên Firebase
-2. Mở muathengay.vn bằng Playwright (headless)
-3. Chọn nhà mạng → mệnh giá → nhập email → mua ngay
-4. Lấy thông tin chuyển khoản → ghi lên Firebase
-5. Poll trang đến khi thấy mã thẻ (hoặc timeout 30 phút)
-6. Gửi mã thẻ lên Telegram + cập nhật Firebase
+Tự động tạo đơn thẻ cào trên muathengay.vn khi có đơn mới từ web_shop.
 """
 
 import asyncio
@@ -24,7 +16,6 @@ from playwright.async_api import async_playwright
 import httpx
 from dotenv import load_dotenv
 
-# ── Load environment ────────────────────────────────────────────────────────
 load_dotenv()
 
 logging.basicConfig(
@@ -34,62 +25,59 @@ logging.basicConfig(
 )
 log = logging.getLogger("accshop-bot")
 
-FIREBASE_DB_URL   = os.getenv("FIREBASE_DB_URL", "")
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT     = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
-ORDER_EMAIL       = os.getenv("ORDER_EMAIL", "bot@example.com")
-ORDER_TIMEOUT     = int(os.getenv("ORDER_TIMEOUT_SECONDS", "1800"))  # 30 phút
-POLL_INTERVAL     = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))    # Poll mã thẻ mỗi 30s
-WATCH_INTERVAL    = int(os.getenv("WATCH_INTERVAL_SECONDS", "5"))    # Check Firebase mỗi 5s
+# ── Config ──────────────────────────────────────────────────────────────────
+FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL", "")
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT   = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
+ORDER_EMAIL     = os.getenv("ORDER_EMAIL", "bot@example.com")
+ORDER_TIMEOUT   = int(os.getenv("ORDER_TIMEOUT_SECONDS", "1800"))
+POLL_INTERVAL   = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+WATCH_INTERVAL  = int(os.getenv("WATCH_INTERVAL_SECONDS", "5"))
 
-# ── Firebase init ───────────────────────────────────────────────────────────
-_sa_json = os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
-if _sa_json:
-    # Railway: dán JSON của service account vào biến môi trường
-    cred = credentials.Certificate(json.loads(_sa_json))
-else:
-    # Local: để file serviceAccount.json cùng thư mục
-    cred = credentials.Certificate("serviceAccount.json")
-
+# ── Firebase ─────────────────────────────────────────────────────────────────
+_sa = os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
+cred = credentials.Certificate(json.loads(_sa)) if _sa else credentials.Certificate("serviceAccount.json")
 firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
-# ── Carrier mapping ─────────────────────────────────────────────────────────
+# ── Carrier map — theo đúng tên hiển thị trên muathengay.vn ─────────────────
 CARRIER_LABEL = {
     "viettel":      "Viettel",
     "mobifone":     "Mobifone",
     "vinaphone":    "Vinaphone",
     "vietnamobile": "Vietnamobile",
     "gmobile":      "Gmobile",
+    "garena":       "Garena",
+    "zing":         "Zing",
+    "vcoin":        "VCoin",
+    "funcard":      "Funcard",
+    "scoin":        "Scoin",
 }
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-def fmt_money(amount: int) -> str:
-    return f"{amount:,}".replace(",", ".") + "đ"
+def fmt_vn(amount: int) -> str:
+    """500000 → '500.000' (định dạng VN, không có đ)"""
+    return f"{amount:,}".replace(",", ".")
 
+def fmt_money(amount: int) -> str:
+    return fmt_vn(amount) + "đ"
+
+# ── Telegram ─────────────────────────────────────────────────────────────────
 async def tg(msg: str):
-    """Gửi tin nhắn Telegram."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        log.warning("Telegram chưa cấu hình, bỏ qua.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, json={
-                "chat_id": TELEGRAM_CHAT,
-                "text": msg,
-                "parse_mode": "HTML",
-            })
-            if not r.json().get("ok"):
-                log.warning(f"Telegram lỗi: {r.text}")
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "HTML"},
+            )
     except Exception as e:
-        log.error(f"Telegram send error: {e}")
+        log.error(f"Telegram error: {e}")
 
+# ── Firebase helpers ──────────────────────────────────────────────────────────
 def db_update(order_id: str, data: dict):
-    """Cập nhật đơn hàng trên Firebase."""
     firebase_db.reference(f"orders/{order_id}").update(data)
 
 def db_get_pending() -> dict:
-    """Lấy tất cả đơn có status='pending_bot' và type='card'."""
     try:
         orders = firebase_db.reference("orders") \
             .order_by_child("status").equal_to("pending_bot").get()
@@ -100,37 +88,43 @@ def db_get_pending() -> dict:
         log.error(f"Firebase query error: {e}")
         return {}
 
-# ── Payment info extractor ───────────────────────────────────────────────────
-async def extract_payment_info(page, expected_amount: int) -> dict:
+# ── Trích xuất thông tin thanh toán ──────────────────────────────────────────
+async def extract_payment_info(page, denomination: int) -> dict:
     """
-    Trích xuất thông tin ngân hàng từ trang thanh toán của muathengay.vn.
-    Dùng nhiều chiến lược để tăng độ tin cậy.
+    Sau khi click Thanh toán, muathengay.vn chuyển sang trang hiển thị
+    thông tin chuyển khoản ngân hàng. Trích xuất các trường cần thiết.
     """
-    info = {"amount": expected_amount}
+    info = {"amount": denomination}
+    await page.wait_for_timeout(2000)
 
-    # Danh sách selector theo trường
-    selectors = {
+    # Các selector thường gặp trên trang thanh toán
+    field_selectors = {
         "bankName": [
             ".bank-name", "[class*='bank-name']", "[class*='ten-ngan-hang']",
-            "td:has-text('Ngân hàng') + td", ".payment-bank-name",
+            "td:has-text('Ngân hàng') + td", ".payment-bank",
+            "tr:has-text('Ngân hàng') td:last-child",
         ],
         "accountNumber": [
             ".account-number", "[class*='account-number']", ".stk",
-            "[class*='so-tai-khoan']", "td:has-text('Số tài khoản') + td",
-            "[class*='bank-account']", ".bank-stk",
+            "td:has-text('Số tài khoản') + td", "[class*='so-tai-khoan']",
+            "tr:has-text('Số tài khoản') td:last-child",
+            "tr:has-text('STK') td:last-child",
         ],
         "accountHolder": [
-            ".account-holder", "[class*='account-holder']", ".owner-name",
-            "td:has-text('Chủ tài khoản') + td", "[class*='chu-tai-khoan']",
+            ".account-holder", "[class*='account-holder']",
+            "td:has-text('Chủ tài khoản') + td",
+            "tr:has-text('Chủ tài khoản') td:last-child",
+            "tr:has-text('Tên tài khoản') td:last-child",
         ],
         "transferContent": [
-            ".transfer-content", "[class*='transfer-content']", ".noi-dung",
-            ".ma-giao-dich", "td:has-text('Nội dung') + td",
-            "[class*='noi-dung']", ".payment-content",
+            ".transfer-content", ".noi-dung", ".ma-giao-dich",
+            "td:has-text('Nội dung') + td", "[class*='noi-dung']",
+            "tr:has-text('Nội dung') td:last-child",
+            "tr:has-text('Mã giao dịch') td:last-child",
         ],
     }
 
-    for field, sels in selectors.items():
+    for field, sels in field_selectors.items():
         for sel in sels:
             try:
                 el = page.locator(sel).first
@@ -138,51 +132,48 @@ async def extract_payment_info(page, expected_amount: int) -> dict:
                     text = (await el.inner_text(timeout=3000)).strip()
                     if text and 2 < len(text) < 200:
                         info[field] = text
-                        log.info(f"  {field} = {text!r}")
+                        log.info(f"  {field}: {text!r}")
                         break
             except Exception:
                 pass
 
-    # Fallback regex nếu selectors không bắt được số tài khoản
+    # Fallback: regex tìm số tài khoản trong HTML
     if not info.get("accountNumber"):
         try:
             content = await page.content()
-            # Số tài khoản ngân hàng VN: 9–16 chữ số
             for m in re.findall(r"\b(\d{9,16})\b", content):
-                # Loại timestamp và năm
-                if not m.startswith(("202", "201", "200", "199")):
+                if not m.startswith(("202", "201", "200", "199", "000")):
                     info["accountNumber"] = m
-                    log.info(f"  accountNumber (regex) = {m}")
+                    log.info(f"  accountNumber (regex): {m}")
                     break
-        except Exception as e:
-            log.warning(f"Regex fallback error: {e}")
+        except Exception:
+            pass
 
     return info
 
-# ── Card code poller ─────────────────────────────────────────────────────────
+# ── Poll mã thẻ ───────────────────────────────────────────────────────────────
 async def poll_card_code(page, order_id: str) -> str | None:
     """
-    Poll trang muathengay.vn mỗi POLL_INTERVAL giây để tìm mã thẻ.
-    Trả về mã thẻ hoặc None nếu hết ORDER_TIMEOUT.
+    Poll trang kết quả muathengay.vn để tìm tên thẻ / số thẻ / số serial.
+    Trả về string dạng 'Tên: X | Số thẻ: X | Serial: X' hoặc chỉ mã thẻ.
     """
     deadline = asyncio.get_event_loop().time() + ORDER_TIMEOUT
-    attempt = 0
+    attempt  = 0
 
-    # Selectors cho mã thẻ/serial
-    code_selectors = [
-        ".card-code", ".the-code", ".ma-the", ".serial-number",
-        "[class*='card-code']", "[class*='ma-the']",
-        ".result-code", ".pin-code", ".topup-code",
-        "td:has-text('Mã thẻ') + td", "td:has-text('Serial') + td",
-        ".topup-result .code", "[data-field='serial']", "[data-field='code']",
+    # Selector cho thông tin thẻ trên trang kết quả
+    card_selectors = [
+        ".card-code", ".ma-the", ".serial", "[class*='card-code']",
+        "[class*='ma-the']", "[class*='serial']",
+        "td:has-text('Số thẻ') + td", "td:has-text('Mã thẻ') + td",
+        "td:has-text('Serial') + td", "td:has-text('Pin') + td",
+        ".result-code", ".topup-code", "[data-field='serial']",
+        "tr:has-text('Số thẻ') td:last-child",
+        "tr:has-text('Mã thẻ') td:last-child",
+        "tr:has-text('Serial') td:last-child",
+        "tr:has-text('Pin') td:last-child",
     ]
 
-    # Regex patterns cho mã thẻ cào VN (thường 9–15 chữ số, có thể có dấu gạch)
-    code_patterns = [
-        r"\b(\d{4}[-\s]\d{4}[-\s]\d{4})\b",           # XXXX-XXXX-XXXX
-        r"\b(\d{4}[-\s]\d{4}[-\s]\d{4}[-\s]\d{4})\b", # XXXX-XXXX-XXXX-XXXX
-        r"\b(\d{9,15})\b",                              # Liền (không dấu)
-    ]
+    card_code_pattern = re.compile(r"\b\d[\d\-\s]{8,25}\d\b")
 
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
@@ -194,53 +185,53 @@ async def poll_card_code(page, order_id: str) -> str | None:
             await page.reload(wait_until="networkidle", timeout=20_000)
             await page.wait_for_timeout(2000)
 
-            # 1. Thử selector
-            for sel in code_selectors:
+            # Thử lấy nhiều trường: tên thẻ, số thẻ, serial
+            card_info = {}
+            content = await page.content()
+
+            # Selector đặc thù
+            for sel in card_selectors:
                 try:
                     el = page.locator(sel).first
                     if await el.count() > 0:
-                        code = (await el.inner_text(timeout=3000)).strip()
-                        # Validate: chỉ gồm số và dấu gạch/khoảng trắng
-                        clean = re.sub(r"[\s\-]", "", code)
+                        val = (await el.inner_text(timeout=2000)).strip()
+                        clean = re.sub(r"[\s\-]", "", val)
                         if re.fullmatch(r"\d{9,20}", clean):
-                            log.info(f"[{order_id}] Mã thẻ tìm thấy (selector): {code}")
-                            return code
+                            log.info(f"[{order_id}] Mã thẻ (selector): {val}")
+                            return val
                 except Exception:
                     pass
 
-            # 2. Regex trong toàn bộ HTML
-            content = await page.content()
-            for pat in code_patterns:
-                matches = re.findall(pat, content)
-                for m in matches:
-                    clean = re.sub(r"[\s\-]", "", m)
-                    if re.fullmatch(r"\d{9,20}", clean):
-                        log.info(f"[{order_id}] Mã thẻ tìm thấy (regex): {m}")
-                        return m.strip()
+            # Thử tìm bảng kết quả có các trường thẻ
+            serial_match = re.search(
+                r"(?:serial|số thẻ|mã thẻ|pin)[:\s]+([0-9\-\s]{9,25})",
+                content, re.IGNORECASE
+            )
+            if serial_match:
+                code = serial_match.group(1).strip()
+                log.info(f"[{order_id}] Mã thẻ (regex): {code}")
+                return code
 
-            # Kiểm tra dấu hiệu thất bại
-            fail_kw = ["hủy đơn", "thất bại", "failed", "không thành công", "đã hết hạn"]
-            if any(kw in content.lower() for kw in fail_kw):
-                log.warning(f"[{order_id}] Phát hiện dấu hiệu đơn thất bại/hủy.")
+            # Kiểm tra đơn thất bại / hủy
+            fail_kw = ["thất bại", "failed", "không thành công", "đã hủy", "hủy đơn"]
+            if any(k in content.lower() for k in fail_kw):
+                log.warning(f"[{order_id}] Phát hiện đơn thất bại trên muathengay.vn")
 
         except Exception as e:
             log.error(f"[{order_id}] Poll error: {e}")
 
-    return None  # Timeout
+    return None
 
-# ── Main order processor ────────────────────────────────────────────────────
+# ── Xử lý đơn hàng chính ─────────────────────────────────────────────────────
 async def process_order(order_id: str, order: dict):
-    """
-    Xử lý một đơn thẻ cào:
-    muathengay.vn → payment info → Firebase → poll mã thẻ → Telegram
-    """
     carrier_key   = (order.get("carrier") or "").lower()
     carrier_label = CARRIER_LABEL.get(carrier_key, carrier_key.capitalize())
     denomination  = int(order.get("denomination") or order.get("price") or 0)
     username      = order.get("username", "?")
-    denom_str     = fmt_money(denomination)
+    denom_vn      = fmt_vn(denomination)   # VD: "500.000"
+    denom_str     = fmt_money(denomination) # VD: "500.000đ"
 
-    log.info(f"[{order_id}] Bắt đầu xử lý: {carrier_label} {denom_str} cho @{username}")
+    log.info(f"[{order_id}] Xử lý: {carrier_label} {denom_str} | @{username}")
     db_update(order_id, {"status": "Đang xử lý", "botStartedAt": datetime.now().isoformat()})
 
     async with async_playwright() as pw:
@@ -248,106 +239,104 @@ async def process_order(order_id: str, order: dict):
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        ctx = await browser.new_context(
+        ctx  = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 900},
         )
         page = await ctx.new_page()
 
         try:
-            # ── 1. Điều hướng ─────────────────────────────────────────
+            # ── 1. Mở trang ──────────────────────────────────────────
             log.info(f"[{order_id}] Mở muathengay.vn...")
             await page.goto("https://www.muathengay.vn/", timeout=40_000)
             await page.wait_for_load_state("networkidle", timeout=20_000)
+            await page.wait_for_timeout(1500)
 
-            # ── 2. Chọn nhà mạng ──────────────────────────────────────
+            # ── 2. Chọn nhà mạng ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn nhà mạng: {carrier_label}")
-            # Thử nhiều cách click carrier
-            carrier_found = False
+            # muathengay.vn hiển thị carrier dưới dạng ô ảnh logo
+            clicked_carrier = False
             for loc_str in [
-                f"[data-carrier='{carrier_key}']",
-                f"button:has-text('{carrier_label}')",
-                f".carrier-item:has-text('{carrier_label}')",
+                f"img[alt='{carrier_label}']",
                 f"img[alt*='{carrier_label}']",
+                f"[title='{carrier_label}']",
                 f"text={carrier_label}",
+                f"*:has-text('{carrier_label}')",
             ]:
                 try:
                     loc = page.locator(loc_str).first
                     if await loc.count() > 0:
                         await loc.click(timeout=5000)
-                        carrier_found = True
-                        log.info(f"  → Click carrier OK: {loc_str}")
+                        clicked_carrier = True
+                        log.info(f"  → Carrier OK: {loc_str}")
                         break
                 except Exception:
                     pass
 
-            if not carrier_found:
-                raise Exception(f"Không tìm thấy nhà mạng '{carrier_label}' trên trang")
+            if not clicked_carrier:
+                raise Exception(f"Không tìm thấy nhà mạng '{carrier_label}'")
             await page.wait_for_timeout(1200)
 
-            # ── 3. Chọn mệnh giá ──────────────────────────────────────
+            # ── 3. Chọn mệnh giá ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn mệnh giá: {denom_str}")
-            denom_variants = [
-                denom_str,
-                f"{denomination:,}".replace(",", "."),
-                f"{denomination // 1000}K",
-                f"{denomination // 1000}k",
-                str(denomination),
-            ]
-            denom_found = False
-            for dv in denom_variants:
+            # muathengay.vn hiển thị "500.000" (không có đ) trong ô mệnh giá
+            clicked_denom = False
+            for dv in [denom_vn, denom_str, str(denomination), f"{denomination // 1000}K"]:
                 for loc_str in [
-                    f"button:has-text('{dv}')",
-                    f".price-item:has-text('{dv}')",
-                    f"[data-value='{denomination}']",
-                    f".denomination:has-text('{dv}')",
                     f"text={dv}",
+                    f"*:has-text('{dv}')",
+                    f"[data-value='{denomination}']",
+                    f"button:has-text('{dv}')",
                 ]:
                     try:
+                        # Lọc đúng ô mệnh giá (tránh click vào "Giá bán")
                         loc = page.locator(loc_str).first
                         if await loc.count() > 0:
                             await loc.click(timeout=5000)
-                            denom_found = True
-                            log.info(f"  → Click denomination OK: {loc_str}")
+                            clicked_denom = True
+                            log.info(f"  → Denomination OK: {loc_str} ({dv})")
                             break
                     except Exception:
                         pass
-                if denom_found:
+                if clicked_denom:
                     break
 
-            if not denom_found:
-                raise Exception(f"Không tìm thấy mệnh giá {denom_str} trên trang")
-            await page.wait_for_timeout(1200)
+            if not clicked_denom:
+                raise Exception(f"Không tìm thấy mệnh giá {denom_str}")
+            await page.wait_for_timeout(1000)
 
-            # ── 4. Nhập email ──────────────────────────────────────────
+            # ── 4. Nhập email ─────────────────────────────────────────
             log.info(f"[{order_id}] Nhập email: {ORDER_EMAIL}")
             for email_sel in [
                 "input[type='email']",
                 "input[name='email']",
                 "input[placeholder*='email' i]",
-                "input[placeholder*='Email' i]",
+                "input[placeholder*='Email']",
+                "#email",
             ]:
                 try:
                     el = page.locator(email_sel).first
                     if await el.count() > 0:
-                        await el.fill(ORDER_EMAIL, timeout=5000)
-                        log.info(f"  → Email nhập OK: {email_sel}")
+                        await el.triple_click(timeout=3000)  # xóa text cũ
+                        await el.fill(ORDER_EMAIL, timeout=3000)
+                        log.info(f"  → Email OK: {email_sel}")
                         break
                 except Exception:
                     pass
             await page.wait_for_timeout(500)
 
-            # ── 5. Click mua ngay ──────────────────────────────────────
-            log.info(f"[{order_id}] Click mua ngay...")
+            # ── 5. Click "Thanh toán" ─────────────────────────────────
+            log.info(f"[{order_id}] Click Thanh toán...")
             for buy_sel in [
-                "button:has-text('Mua ngay')",
-                "button:has-text('MUA NGAY')",
-                "button:has-text('Đặt hàng')",
                 "button:has-text('Thanh toán')",
+                "a:has-text('Thanh toán')",
+                "button:has-text('THANH TOÁN')",
+                "button:has-text('Mua ngay')",
+                "button:has-text('Đặt hàng')",
                 "input[type='submit']",
                 "button[type='submit']",
             ]:
@@ -355,26 +344,19 @@ async def process_order(order_id: str, order: dict):
                     loc = page.locator(buy_sel).first
                     if await loc.count() > 0:
                         await loc.click(timeout=8000)
-                        log.info(f"  → Click buy OK: {buy_sel}")
+                        log.info(f"  → Buy OK: {buy_sel}")
                         break
                 except Exception:
                     pass
 
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-            await page.wait_for_timeout(2500)
+            await page.wait_for_load_state("networkidle", timeout=25_000)
+            await page.wait_for_timeout(3000)
 
-            # ── 6. Lấy thông tin thanh toán ───────────────────────────
+            # ── 6. Lấy thông tin thanh toán ──────────────────────────
             log.info(f"[{order_id}] Trích xuất thông tin thanh toán...")
             payment_info = await extract_payment_info(page, denomination)
 
-            if not payment_info.get("accountNumber"):
-                # Debug: chụp ảnh màn hình
-                screenshot_path = f"/tmp/debug_{order_id}.png"
-                await page.screenshot(path=screenshot_path)
-                log.warning(f"  → Không tìm thấy STK. Screenshot: {screenshot_path}")
-                # Vẫn tiếp tục với thông tin không đầy đủ
-                # raise Exception("Không tìm thấy thông tin chuyển khoản")
-
+            # Cập nhật Firebase → web_shop hiển thị ngay cho khách
             db_update(order_id, {
                 "status": "Chờ thanh toán",
                 "paymentInfo": payment_info,
@@ -387,20 +369,20 @@ async def process_order(order_id: str, order: dict):
                 f"🏦 Ngân hàng: {payment_info.get('bankName', '?')}\n"
                 f"💰 Số TK: <code>{payment_info.get('accountNumber', '?')}</code>\n"
                 f"👤 Chủ TK: {payment_info.get('accountHolder', '?')}\n"
-                f"💵 Số tiền: <b>{fmt_money(denomination)}</b>\n"
+                f"💵 Số tiền: <b>{denom_str}</b>\n"
                 f"📝 Nội dung: <code>{payment_info.get('transferContent', '?')}</code>\n"
-                f"⏳ Đang chờ khách chuyển khoản ({ORDER_TIMEOUT // 60} phút)..."
+                f"⏳ Chờ khách chuyển khoản..."
             )
-            log.info(f"[{order_id}] Payment info cập nhật Firebase OK. Bắt đầu poll mã thẻ...")
+            log.info(f"[{order_id}] Payment info → Firebase OK. Poll mã thẻ...")
 
             # ── 7. Poll mã thẻ ────────────────────────────────────────
-            card_code = await poll_card_code(page, order_id)
+            card_result = await poll_card_code(page, order_id)
 
-            if card_code:
+            if card_result:
                 db_update(order_id, {
                     "status": "Hoàn thành",
-                    "cardCode": card_code,
-                    "accountDetails": f"Mã thẻ: {card_code}",
+                    "cardCode": card_result,
+                    "accountDetails": card_result,
                     "completedAt": datetime.now().isoformat(),
                 })
                 await tg(
@@ -408,11 +390,11 @@ async def process_order(order_id: str, order: dict):
                     f"📱 {carrier_label} {denom_str}\n"
                     f"👤 Khách: <code>{username}</code>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔑 <b>Mã thẻ:</b> <code>{card_code}</code>\n"
+                    f"🔑 <b>{card_result}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"✅ Đã cập nhật lên web!"
+                    f"✅ Đã cập nhật web!"
                 )
-                log.info(f"[{order_id}] ✅ Hoàn thành! Mã thẻ: {card_code}")
+                log.info(f"[{order_id}] ✅ Xong! {card_result}")
             else:
                 db_update(order_id, {
                     "status": "Hết hạn",
@@ -420,42 +402,35 @@ async def process_order(order_id: str, order: dict):
                 })
                 await tg(
                     f"⏰ <b>Hết hạn — Đơn {order_id}</b>\n"
-                    f"Khách không thanh toán sau {ORDER_TIMEOUT // 60} phút.\n"
+                    f"Không thanh toán sau {ORDER_TIMEOUT // 60} phút.\n"
                     f"📱 {carrier_label} {denom_str} / @{username}"
                 )
-                log.warning(f"[{order_id}] ⏰ Hết hạn.")
+                log.warning(f"[{order_id}] Hết hạn.")
 
         except Exception as e:
-            log.error(f"[{order_id}] ❌ Lỗi: {e}")
+            log.error(f"[{order_id}] Lỗi: {e}")
             db_update(order_id, {
                 "status": "Lỗi",
                 "errorMessage": str(e)[:500],
                 "errorAt": datetime.now().isoformat(),
             })
-            await tg(
-                f"❌ <b>Lỗi đơn {order_id}</b>\n"
-                f"📱 {carrier_label} {denom_str} / @{username}\n"
-                f"⚠️ {str(e)[:300]}"
-            )
+            await tg(f"❌ <b>Lỗi đơn {order_id}</b>\n{str(e)[:300]}")
         finally:
             await browser.close()
-            log.info(f"[{order_id}] Browser đóng.")
 
-# ── Task wrapper ─────────────────────────────────────────────────────────────
+# ── Task wrapper ──────────────────────────────────────────────────────────────
 async def handle_order(order_id: str, order: dict, processing: set):
     try:
         await process_order(order_id, order)
     finally:
         processing.discard(order_id)
 
-# ── Firebase watcher ─────────────────────────────────────────────────────────
+# ── Vòng lặp chính ───────────────────────────────────────────────────────────
 async def watch():
-    """Vòng lặp chính: poll Firebase và xử lý đơn mới."""
     log.info("=" * 50)
-    log.info("AccShop Bot khởi động.")
-    log.info(f"Email đặt hàng: {ORDER_EMAIL}")
-    log.info(f"Timeout: {ORDER_TIMEOUT}s ({ORDER_TIMEOUT // 60} phút)")
-    log.info(f"Poll mã thẻ: mỗi {POLL_INTERVAL}s")
+    log.info("AccShop Bot khởi động")
+    log.info(f"Email: {ORDER_EMAIL}")
+    log.info(f"Timeout: {ORDER_TIMEOUT}s | Poll: {POLL_INTERVAL}s")
     log.info("=" * 50)
 
     processing: set = set()
@@ -469,10 +444,9 @@ async def watch():
                     log.info(f"📦 Đơn mới: {order_id}")
                     asyncio.create_task(handle_order(order_id, order, processing))
         except Exception as e:
-            log.error(f"Watch loop error: {e}")
+            log.error(f"Watch error: {e}")
 
         await asyncio.sleep(WATCH_INTERVAL)
 
-# ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     asyncio.run(watch())
