@@ -13,6 +13,7 @@ from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 import httpx
 from dotenv import load_dotenv
 
@@ -257,13 +258,25 @@ async def process_order(order_id: str, order: dict):
             viewport={"width": 1280, "height": 900},
         )
         page = await ctx.new_page()
+        await stealth_async(page)   # ← ẩn dấu hiệu headless, qua Cloudflare
 
         try:
             # ── 1. Mở trang ──────────────────────────────────────────
             log.info(f"[{order_id}] Mở muathengay.vn...")
-            await page.goto("https://www.muathengay.vn/", timeout=40_000)
+            await page.goto("https://www.muathengay.vn/", timeout=60_000)
+
+            # Chờ Cloudflare "Just a moment..." tự qua (tối đa 20s)
+            try:
+                await page.wait_for_function(
+                    "document.title !== 'Just a moment...'",
+                    timeout=20_000
+                )
+                log.info(f"[{order_id}] Đã qua Cloudflare.")
+            except Exception:
+                log.warning(f"[{order_id}] Cloudflare timeout, tiếp tục...")
+
             await page.wait_for_load_state("networkidle", timeout=20_000)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
             # ── 2. Chọn nhà mạng ─────────────────────────────────────
             log.info(f"[{order_id}] Chọn nhà mạng: {carrier_label}")
