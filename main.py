@@ -48,7 +48,7 @@ CARRIER_LABEL = {
     "gmobile":      "Gmobile",
     "garena":       "Garena",
     "zing":         "Zing",
-    "vcoin":        "VCoin",
+    "vcoin":        "Vtc",        # muathengay.vn dùng alt="Mua thẻ Vtc"
     "funcard":      "Funcard",
     "scoin":        "Scoin",
 }
@@ -281,13 +281,12 @@ async def process_order(order_id: str, order: dict):
             log.info(f"[{order_id}] Chọn mệnh giá: {denom_str}")
             # muathengay.vn hiển thị "500.000" (không có đ) trong ô mệnh giá
             clicked_denom = False
-            # muathengay.vn dùng <button><h6 class="text-lg font-bold">100.000</h6>...
+            # muathengay.vn: denomination là button[type='submit'] chứa text "100.000Giá bán:..."
             for loc_str in [
-                f"button:has(h6:has-text('{denom_vn}'))",   # chính xác nhất
-                f"h6:has-text('{denom_vn}')",                # h6 chứa "100.000"
-                f"button:has-text('{denom_vn}')",            # button chứa text
+                f"button[type='submit']:has-text('{denom_vn}')",  # chính xác nhất
+                f"button:has(h6:has-text('{denom_vn}'))",         # h6 chứa face value
+                f"button[type='submit'] h6:has-text('{denom_vn}')",
                 f"text={denom_vn}",
-                f"[data-value='{denomination}']",
             ]:
                 try:
                     loc = page.locator(loc_str).first
