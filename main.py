@@ -448,5 +448,25 @@ async def watch():
 
         await asyncio.sleep(WATCH_INTERVAL)
 
+async def startup_test():
+    """Kiểm tra kết nối Firebase khi bot khởi động."""
+    log.info("🔍 Kiểm tra kết nối Firebase...")
+    try:
+        test = firebase_db.reference("orders").limit_to_last(1).get()
+        log.info(f"✅ Firebase OK — {len(test) if test else 0} đơn sample")
+    except Exception as e:
+        log.error(f"❌ Firebase lỗi: {e}")
+
+    log.info(f"🤖 Telegram token: {'OK' if TELEGRAM_TOKEN else '⚠ TRỐNG!'}")
+    log.info(f"📧 Email đặt hàng: {ORDER_EMAIL}")
+    log.info(f"🌐 Firebase URL: {FIREBASE_DB_URL}")
+
+    # Gửi Telegram ping
+    await tg("🟢 <b>AccShop Bot đã khởi động!</b>\nĐang theo dõi đơn hàng...")
+
+
 if __name__ == "__main__":
-    asyncio.run(watch())
+    async def main():
+        await startup_test()
+        await watch()
+    asyncio.run(main())
