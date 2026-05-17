@@ -91,60 +91,41 @@ def db_get_pending() -> dict:
 # ── Trích xuất thông tin thanh toán ──────────────────────────────────────────
 async def extract_payment_info(page, denomination: int) -> dict:
     """
-    Sau khi click Thanh toán, muathengay.vn chuyển sang trang hiển thị
-    thông tin chuyển khoản ngân hàng. Trích xuất các trường cần thiết.
+    Trang /thanh-toan-don-hang của muathengay.vn hiển thị:
+      Chủ tài khoản / Ngân hàng / Số tài khoản / Số tiền / Nội dung chuyển khoản
+    Dùng inner_text() của body rồi parse bằng regex theo nhãn chữ.
     """
     info = {"amount": denomination}
     await page.wait_for_timeout(2000)
 
-    # Các selector thường gặp trên trang thanh toán
-    field_selectors = {
-        "bankName": [
-            ".bank-name", "[class*='bank-name']", "[class*='ten-ngan-hang']",
-            "td:has-text('Ngân hàng') + td", ".payment-bank",
-            "tr:has-text('Ngân hàng') td:last-child",
-        ],
-        "accountNumber": [
-            ".account-number", "[class*='account-number']", ".stk",
-            "td:has-text('Số tài khoản') + td", "[class*='so-tai-khoan']",
-            "tr:has-text('Số tài khoản') td:last-child",
-            "tr:has-text('STK') td:last-child",
-        ],
-        "accountHolder": [
-            ".account-holder", "[class*='account-holder']",
-            "td:has-text('Chủ tài khoản') + td",
-            "tr:has-text('Chủ tài khoản') td:last-child",
-            "tr:has-text('Tên tài khoản') td:last-child",
-        ],
-        "transferContent": [
-            ".transfer-content", ".noi-dung", ".ma-giao-dich",
-            "td:has-text('Nội dung') + td", "[class*='noi-dung']",
-            "tr:has-text('Nội dung') td:last-child",
-            "tr:has-text('Mã giao dịch') td:last-child",
-        ],
-    }
+    try:
+        body_text = await page.inner_text("body")
+        log.info(f"  [payment page text]:\n{body_text[:500]}")
 
-    for field, sels in field_selectors.items():
-        for sel in sels:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    text = (await el.inner_text(timeout=3000)).strip()
-                    if text and 2 < len(text) < 200:
-                        info[field] = text
-                        log.info(f"  {field}: {text!r}")
-                        break
-            except Exception:
-                pass
+        label_patterns = {
+            "accountHolder":   r"Chủ tài khoản\s*\n\s*(.+)",
+            "bankName":        r"Ngân hàng\s*\n\s*(.+)",
+            "accountNumber":   r"Số tài khoản\s*\n\s*([\d\s]+)",
+            "transferContent": r"Nội dung chuyển khoản\s*\n\s*(.+)",
+        }
+        for field, pattern in label_patterns.items():
+            m = re.search(pattern, body_text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip().split("\n")[0].strip()
+                if val:
+                    info[field] = val
+                    log.info(f"  {field}: {val!r}")
+    except Exception as e:
+        log.error(f"  extract_payment_info error: {e}")
 
-    # Fallback: regex tìm số tài khoản trong HTML
+    # Fallback regex: tìm số TK 6-16 chữ số trong HTML
     if not info.get("accountNumber"):
         try:
-            content = await page.content()
-            for m in re.findall(r"\b(\d{9,16})\b", content):
-                if not m.startswith(("202", "201", "200", "199", "000")):
+            html = await page.content()
+            for m in re.findall(r"\b(\d{6,16})\b", html):
+                if not re.match(r"^(202|201|200|199|000|202[456])", m):
                     info["accountNumber"] = m
-                    log.info(f"  accountNumber (regex): {m}")
+                    log.info(f"  accountNumber (regex fallback): {m}")
                     break
         except Exception:
             pass
@@ -342,28 +323,49 @@ async def process_order(order_id: str, order: dict):
                     pass
             await page.wait_for_timeout(500)
 
-            # ── 5. Click "Thanh toán" ─────────────────────────────────
-            log.info(f"[{order_id}] Click Thanh toán...")
+            # ── 5. Click "Thanh toán" lần 1 ──────────────────────────
+            log.info(f"[{order_id}] Click Thanh toán lần 1...")
             for buy_sel in [
-                "button[type='button']:has-text('Thanh toán')",  # chính xác theo HTML thật
+                "button[type='button']:has-text('Thanh toán')",
                 "button:has-text('Thanh toán')",
                 "button.bg-primary:has-text('Thanh toán')",
                 "button:has-text('THANH TOÁN')",
-                "button:has-text('Mua ngay')",
-                "input[type='submit']",
-                "button[type='submit']",
             ]:
                 try:
                     loc = page.locator(buy_sel).first
                     if await loc.count() > 0:
                         await loc.click(timeout=8000)
-                        log.info(f"  → Buy OK: {buy_sel}")
+                        log.info(f"  → Click 1 OK: {buy_sel}")
                         break
                 except Exception:
                     pass
 
-            await page.wait_for_load_state("networkidle", timeout=25_000)
-            await page.wait_for_timeout(3000)
+            # Chờ modal xác nhận (muathengay.vn hiện modal trước khi redirect)
+            await page.wait_for_timeout(2000)
+
+            # Click "Thanh toán" lần 2 trong modal (nếu URL chưa đổi)
+            if "thanh-toan-don-hang" not in page.url:
+                log.info(f"[{order_id}] Modal xác nhận → click Thanh toán lần 2...")
+                try:
+                    # Lấy nút Thanh toán cuối cùng (trong modal)
+                    btns = page.locator("button:has-text('Thanh toán')")
+                    cnt = await btns.count()
+                    log.info(f"  Tìm thấy {cnt} nút Thanh toán")
+                    if cnt > 0:
+                        await btns.last.click(timeout=8000)
+                        log.info("  → Click modal OK")
+                except Exception as e:
+                    log.warning(f"  Modal click lỗi: {e}")
+
+            # Chờ chuyển sang trang /thanh-toan-don-hang
+            try:
+                await page.wait_for_url("**/thanh-toan-don-hang**", timeout=20_000)
+                log.info(f"[{order_id}] URL đã đổi → {page.url[:80]}")
+            except Exception:
+                log.warning(f"[{order_id}] Không chờ được URL, tiếp tục...")
+
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+            await page.wait_for_timeout(2000)
 
             # ── 6. Lấy thông tin thanh toán ──────────────────────────
             log.info(f"[{order_id}] Trích xuất thông tin thanh toán...")
